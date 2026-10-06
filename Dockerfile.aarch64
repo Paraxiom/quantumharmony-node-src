@@ -1,0 +1,22 @@
+FROM --platform=linux/amd64 rust:1.85-bookworm
+
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && \
+    apt-get install -y \
+      gcc-aarch64-linux-gnu \
+      g++-aarch64-linux-gnu \
+      libc6-dev-arm64-cross \
+      protobuf-compiler \
+      pkg-config \
+      libssl-dev \
+      clang \
+      cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add aarch64-unknown-linux-gnu wasm32-unknown-unknown && \
+    rustup component add rust-src
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu

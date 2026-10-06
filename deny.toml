@@ -1,0 +1,48 @@
+# "No C" gate. Rule: Paraxiom code is pure Rust.
+#
+# `cargo deny check bans` fails when a crate that compiles C, C++ or assembly
+# enters the dependency graph, or when one that is already here gains a new
+# direct dependent. The entries under "Known exceptions" are debt, not
+# permission: each names the only crates allowed to pull it today. Remove an
+# entry when its crate leaves the graph; never add a wrapper to make CI pass.
+#
+# State recorded 2026-09-30, fork rev 624ba59e. See
+# docs/migrations/paraxiom-pqc-phases-2-3-schedule.md for the PQ crates.
+
+[graph]
+all-features = false
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+deny = [
+    # ---- Known exceptions: PQClean C in cryptography (ours to remove) ----
+    { crate = "pqcrypto-sphincsplus", wrappers = ["sp-core", "quantumharmony-node", "node-operator", "pq-triple-ratchet", "qh-falcon-verify"], reason = "PQClean C. Consensus signatures via the fork's sp-core. Phase 3 of the paraxiom-pqc migration." },
+    { crate = "pqcrypto-falcon", wrappers = ["sc-network", "quantumharmony-node"], reason = "PQClean C. Phase 2 of the paraxiom-pqc migration." },
+    { crate = "pqcrypto-kyber", wrappers = ["sc-network"], reason = "PQClean C, Round 3 Kyber. Leaves with the fork's pqc-stream-framing branch." },
+    { crate = "pqcrypto-internals", wrappers = ["pqcrypto-sphincsplus", "pqcrypto-falcon", "pqcrypto-kyber"], reason = "PQClean C helpers." },
+
+    # ---- Known exceptions: inherited from Substrate and the ecosystem ----
+    { crate = "ring", wrappers = ["rustls", "rustls-webpki", "sct", "snow"], reason = "C and assembly. TLS and libp2p noise." },
+    { crate = "zstd-sys", wrappers = ["zstd-safe"], reason = "C. Runtime blob compression and wasmtime cache." },
+    { crate = "lz4-sys", wrappers = ["lz4"], reason = "C. parity-db compression." },
+    { crate = "psm", wrappers = ["wasmtime"], reason = "C and assembly stack helper in the wasm executor." },
+    { crate = "wasm-opt-sys", wrappers = ["wasm-opt", "wasm-opt-cxx-sys"], reason = "C++ (Binaryen). Build time only." },
+    { crate = "wasm-opt-cxx-sys", wrappers = ["wasm-opt"], reason = "C++ (Binaryen). Build time only." },
+
+    # ---- Not in the graph today. Must not come back. ----
+    { crate = "secp256k1-sys", reason = "C. Left the graph 2026-09-30 with the stray sp-core copies." },
+    { crate = "librocksdb-sys", reason = "C++. The node uses parity-db." },
+    { crate = "openssl-sys", reason = "C." },
+    { crate = "aws-lc-sys", reason = "C." },
+    { crate = "libsqlite3-sys", reason = "C." },
+    { crate = "bzip2-sys", reason = "C." },
+    { crate = "libz-sys", reason = "C." },
+    { crate = "tikv-jemalloc-sys", reason = "C." },
+    { crate = "oqs-sys", reason = "C (liboqs)." },
+    { crate = "pqcrypto-dilithium", reason = "PQClean C." },
+    { crate = "pqcrypto-mlkem", reason = "PQClean C." },
+    { crate = "pqcrypto-mldsa", reason = "PQClean C." },
+    { crate = "blst", reason = "C and assembly." },
+]

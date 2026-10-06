@@ -1,0 +1,86 @@
+name: Build Multi-Arch Docker Image
+
+# Least-privilege default token (OpenSSF Scorecard Token-Permissions).
+# Push is to Docker Hub via login-action secrets, not GITHUB_TOKEN, so
+# contents: read is sufficient.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: >-
+          Target platforms. Default is amd64 only: every QuantumHarmony
+          validator is x86_64, and arm64 is built under QEMU emulation, which
+          for a Substrate node takes hours and risks the 6h job limit.
+        required: false
+        default: linux/amd64
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: sylvaincormier/quantumharmony-node
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Rust builds take a while
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.production
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect image
+        # `latest` is only pushed from the default branch, so inspecting it on a
+        # release branch fails and turns an otherwise successful build red.
+        # Inspect the tags this run actually pushed instead.
+        run: |
+          set -e
+          echo "${{ steps.meta.outputs.tags }}" | while read -r t; do
+            [ -n "$t" ] || continue
+            echo "== $t"
+            docker buildx imagetools inspect "$t"
+          done

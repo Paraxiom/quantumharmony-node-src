@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+*.pdb
+
+# Git
+.git/
+.gitignore
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+*.md
+docs/
+README*
+LICENSE*
+
+# Test data
+test-data/
+*.log
+
+# Local dev
+.env
+.env.*
+*.local
+
+# Node operator dashboard (separate image)
+node-operator-dashboard/
+
+# Chain data (can be 18GB+)
+production-data/
+chains/
+data/
+
+# Misc
+*.bak
+*.tmp

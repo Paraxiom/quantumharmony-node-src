@@ -1,0 +1,35 @@
+name: No C gate
+
+# Paraxiom rule: pure Rust. This job fails when a crate that compiles C, C++
+# or assembly enters the dependency graph, or when one already listed in
+# deny.toml gains a new direct dependent. It resolves the graph only; it
+# builds nothing.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/no-c.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/no-c.yml'
+  workflow_dispatch:
+
+jobs:
+  bans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans
+          arguments: --locked

@@ -1,0 +1,14 @@
+[package]
+name = "pohc-falcon-attest"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "PoHC E1 attestation harness — real Falcon-1024 signatures via paraxiom-pqc (pure Rust, zero C). Replaces the Python E1 HMAC stand-in."
+publish = false
+
+# Standalone: keep this tool out of the quantumharmony root workspace.
+[workspace]
+
+[dependencies]
+# Pure Rust, zero C. `sign` pulls ml-dsa/slh-dsa/falcon-rs; we use Falcon only.
+paraxiom-pqc = { path = "../../../paraxiom-pqc", default-features = false, features = ["sign"] }

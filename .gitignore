@@ -1,0 +1,59 @@
+# Build artifacts
+target/
+*.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local config
+.env
+*.local
+
+# Secret keys — NEVER commit
+*.sec
+*.key
+*.secret
+*-sphincs-secret.*
+keys/
+
+# Sensitive docs (moved to Paraxiom/docs private repo)
+docs/QBER_ATTESTATION_ARCHITECTURE.md
+docs/SYSTEM_ARCHITECTURE_50K.*
+docs/youtube-demo-script.md
+docs/security/SECURITY_ASSESSMENT_REPORT.md
+docs/security/FORMAL_VERIFICATION.md
+docs/ISO/THREAT_MODEL.md
+docs/ISO/KEY_MANAGEMENT.md
+docs/ISO/KEY_ROTATION_PROCEDURES.md
+docs/ISO/SECURITY_CONTROLS.md
+docs/MD/SECURITY_HARDENING.md
+docs/MD/QUANTUM_HARDWARE_SECURITY.md
+docs/MD/COMPETITIVE_ADVANTAGES.md
+
+# Node modules (for wallet/browser-extension)
+node_modules/
+
+# Test artifacts
+*.profraw
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# LaTeX build artifacts (zenodo note builds locally; PDF is the Zenodo upload, not a repo artifact)
+docs/scaling/zenodo-note/*.aux
+docs/scaling/zenodo-note/*.out
+docs/scaling/zenodo-note/*.pdf

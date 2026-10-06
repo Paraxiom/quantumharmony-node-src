@@ -1,0 +1,62 @@
+name: RPC caller auth
+
+# The node verifies Falcon signatures from the transparence-signer sidecar
+# (and, through it, trust-services). These tests fail if the node's Falcon
+# encoding drifts from a signature the real sidecar produced
+# (node/src/rpc/fixtures/sidecar_falcon512.json), or if the Transparence
+# request bytes drift from the Go adapter's golden vectors.
+#
+# Scoped to the files that can cause that drift: building the node is heavy.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths:
+      - 'node/src/rpc/caller_auth.rs'
+      - 'node/src/rpc/notarial_rpc.rs'
+      - 'node/src/rpc/transparence_rpc.rs'
+      - 'node/src/rpc/fixtures/**'
+      - 'node/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rpc-caller-auth.yml'
+  pull_request:
+    paths:
+      - 'node/src/rpc/caller_auth.rs'
+      - 'node/src/rpc/notarial_rpc.rs'
+      - 'node/src/rpc/transparence_rpc.rs'
+      - 'node/src/rpc/fixtures/**'
+      - 'node/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rpc-caller-auth.yml'
+  workflow_dispatch:
+
+jobs:
+  caller-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libssl-dev pkg-config protobuf-compiler
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: caller-auth-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: caller-auth-${{ runner.os }}-
+
+      - name: caller_auth tests (no wasm runtime needed)
+        env:
+          SKIP_WASM_BUILD: '1'
+        run: cargo test -p quantumharmony-node --bin quantumharmony-node rpc::caller_auth

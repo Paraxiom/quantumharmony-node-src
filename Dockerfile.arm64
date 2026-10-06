@@ -1,0 +1,41 @@
+FROM rust:1.85-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    cmake \
+    git \
+    libssl-dev \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+RUN rustup component add rust-src
+
+WORKDIR /build
+
+ARG GH_TOKEN=""
+RUN if [ -n "$GH_TOKEN" ]; then git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"; fi
+
+COPY . .
+
+RUN SKIP_WASM_BUILD=0 cargo build --release -p quantumharmony-node \
+    && cp /build/target/release/quantumharmony-node /quantumharmony-node
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /quantumharmony-node /usr/local/bin/
+
+RUN mkdir -p /data /config
+
+EXPOSE 30333 9944 9615
+VOLUME ["/data", "/config"]
+
+ENTRYPOINT ["/usr/local/bin/quantumharmony-node"]

@@ -1,0 +1,40 @@
+[package]
+name = "pallet-substrate-attestation"
+version = "0.1.0"
+description = "On-chain commitments to LLM weights provenance. Implements identity-architecture treatise §14 item 6 (Paraxiom/quantumharmony#34): model identity binding, parent-model lineage, and training-attestation pointers. Complements pallet-axiom-attestation, which records per-task agent activity; this pallet records the artifact (weights) those agents derive from."
+authors = ["Paraxiom Technologies Inc."]
+homepage = "https://paraxiom.org"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Paraxiom/quantumharmony"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+codec = { package = "parity-scale-codec", workspace = true, default-features = false, features = ["derive"] }
+scale-info = { workspace = true, default-features = false, features = ["derive"] }
+frame-support = { workspace = true, default-features = false }
+frame-system = { workspace = true, default-features = false }
+sp-std = { workspace = true, default-features = false }
+sp-runtime = { workspace = true, default-features = false }
+sp-io = { workspace = true, default-features = false }
+log = { workspace = true }
+
+[dev-dependencies]
+sp-core = { workspace = true, features = ["std"] }
+sp-io = { workspace = true, features = ["std"] }
+
+[features]
+default = ["std"]
+std = [
+    "codec/std",
+    "scale-info/std",
+    "frame-support/std",
+    "frame-system/std",
+    "sp-std/std",
+    "sp-runtime/std",
+    "sp-io/std",
+]
+runtime-benchmarks = ["frame-support/runtime-benchmarks"]
+try-runtime = ["frame-support/try-runtime"]

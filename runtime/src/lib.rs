@@ -1,0 +1,1284 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+// `construct_runtime!` does a lot of recursion and requires us to increase the limits.
+#![recursion_limit = "1024"]
+
+// Make the WASM binary available.
+#[cfg(feature = "std")]
+include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
+
+// Quantum-resistant hasher module (Keccak-256 with QRNG entropy pool support)
+pub mod quantum_hasher;
+use quantum_hasher::QuantumHasher;
+
+// Quantum configuration (randomness source)
+pub mod quantum_config;
+
+// Storage migrations for runtime upgrades
+pub mod migrations;
+
+// Genesis config presets
+pub mod genesis_config_presets;
+
+// Wallet API for balance queries
+pub mod wallet_api;
+
+// Using fork's sp_runtime::MultiSignature which already supports SPHINCS+ only
+
+// GRANDPA removed - quantum-vulnerable (uses Ed25519/BLS)
+// Finality provided by Proof of Coherence consensus
+use sp_api::impl_runtime_apis;
+use sp_consensus_aura::sphincs::AuthorityId as AuraId;
+use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
+use sp_runtime::{
+    create_runtime_str, generic, impl_opaque_keys,
+    traits::{
+        AccountIdLookup, Block as BlockT, Hash as HashT, IdentifyAccount, NumberFor, One, Verify,
+    },
+    transaction_validity::{TransactionSource, TransactionValidity},
+    ApplyExtrinsicResult,
+};
+use sp_std::prelude::*;
+extern crate alloc;
+use alloc::string::String;
+#[cfg(feature = "std")]
+use sp_version::NativeVersion;
+use sp_version::RuntimeVersion;
+
+// Genesis builder helpers
+use frame_support::genesis_builder_helper::{build_state, get_preset};
+
+// A few exports that help ease life for downstream crates.
+pub use frame_support::{
+    construct_runtime, parameter_types,
+    traits::{
+        ConstBool, ConstU128, ConstU32, ConstU64, ConstU8, EqualPrivilegeOnly, KeyOwnerProofSystem,
+        Randomness, StorageInfo,
+    },
+    weights::{
+        constants::{
+            BlockExecutionWeight, ExtrinsicBaseWeight, ParityDbWeight, WEIGHT_REF_TIME_PER_SECOND,
+        },
+        IdentityFee, Weight,
+    },
+    PalletId, StorageValue,
+};
+pub use frame_system::Call as SystemCall;
+pub use pallet_balances::Call as BalancesCall;
+pub use pallet_timestamp::Call as TimestampCall;
+pub use pallet_sudo::Call as SudoCall;
+use pallet_transaction_payment::{ConstFeeMultiplier, CurrencyAdapter};
+#[cfg(any(feature = "std", test))]
+pub use sp_runtime::BuildStorage;
+pub use sp_runtime::{Perbill, Permill};
+
+// Additional imports for governance
+use frame_support::{
+    traits::EitherOfDiverse,
+    dispatch::DispatchClass,
+};
+use frame_system::EnsureRoot;
+
+/// Import the quantum configuration - temporarily disabled for incremental build
+// NOTE: Disabled due to fork API incompatibilities (ConstU32 TypeInfo, BoundedVec conversion)
+// pub mod quantum_config;
+
+/// Alias to quantum-safe signature type (fork's MultiSignature supports SPHINCS+ only)
+pub type Signature = sp_runtime::MultiSignature;
+
+/// Some way of identifying an account on the chain. We intentionally make it equivalent
+/// to the public key of our transaction signing scheme.
+pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
+
+/// Balance of an account.
+pub type Balance = u128;
+
+/// Index of a transaction in the chain.
+pub type Index = u32;
+
+/// Nonce type alias for Index (for node compatibility)
+pub type Nonce = Index;
+
+/// A hash of some data used by the chain.
+pub type Hash = sp_core::H256;
+
+/// Opaque types. These are used by the CLI to instantiate machinery that don't need to know
+/// the specifics of the runtime. They can then be made to be agnostic over specific formats
+/// of data like extrinsics, allowing for them to continue syncing the network through upgrades
+/// to even the core data structures.
+pub mod opaque {
+    use super::*;
+
+    pub use sp_runtime::OpaqueExtrinsic as UncheckedExtrinsic;
+
+    /// Opaque block header type (using quantum-resistant QuantumHasher with QRNG support).
+    pub type Header = generic::Header<BlockNumber, QuantumHasher>;
+    /// Opaque block type.
+    pub type Block = generic::Block<Header, UncheckedExtrinsic>;
+    /// Opaque block identifier type.
+    pub type BlockId = generic::BlockId<Block>;
+
+    impl_opaque_keys! {
+        pub struct SessionKeys {
+            pub aura: Aura,
+            // GRANDPA removed - using Proof of Coherence for finality
+        }
+    }
+}
+
+// To learn more about runtime versioning, see:
+// https://docs.substrate.io/main-docs/build/upgrade#runtime-versioning
+#[sp_version::runtime_version]
+pub const VERSION: RuntimeVersion = RuntimeVersion {
+    spec_name: create_runtime_str!("quantumharmony"),
+    impl_name: create_runtime_str!("quantumharmony"),
+    authoring_version: 1,
+    // v44: pallet_thin_slasher wired (BGFL 4-layer justice stake layer, #51 mainnet
+    //      pre-req). Conservative testnet defaults: 1-token MinimumDeposit, 50%
+    //      SlashFraction, EnsureRoot as ConvictionOrigin (sudo-gated).
+    // v45: notarial pallet v1 — requester proof fields + AuditAnchor category +
+    //      `notarize` extrinsic (Transparence anchoring). Runs migrations::v1 (v0→v1)
+    //      on the next runtime upgrade. 45 > live v44, so the migration triggers.
+    spec_version: 47,
+    impl_version: 1,
+    apis: RUNTIME_API_VERSIONS,
+    transaction_version: 1,
+    system_version: 1,
+};
+
+/// The version information used to identify this runtime when compiled natively.
+#[cfg(feature = "std")]
+pub fn native_version() -> NativeVersion {
+    NativeVersion { runtime_version: VERSION, can_author_with: Default::default() }
+}
+
+const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
+
+parameter_types! {
+    pub const BlockHashCount: BlockNumber = 2400;
+    pub const Version: RuntimeVersion = VERSION;
+    /// We allow for 2 seconds of compute with a 3 second average block time.
+    pub BlockWeights: frame_system::limits::BlockWeights =
+        frame_system::limits::BlockWeights::with_sensible_defaults(
+            Weight::from_parts(2u64 * WEIGHT_REF_TIME_PER_SECOND, u64::MAX),
+            NORMAL_DISPATCH_RATIO,
+        );
+    // Increased to 2MB to accommodate large runtime upgrade extrinsics
+    // Runtime upgrade = 598KB WASM + 50KB SPHINCS+ signature ≈ 650KB
+    // Using 2MB provides headroom for future larger runtimes
+    pub BlockLength: frame_system::limits::BlockLength = frame_system::limits::BlockLength
+        ::max_with_normal_ratio(2 * 1024 * 1024, NORMAL_DISPATCH_RATIO);
+    pub const SS58Prefix: u8 = 42;
+}
+
+// Configure FRAME pallets to include in runtime.
+
+impl frame_system::Config for Runtime {
+    /// The basic call filter to use in dispatchable.
+    type BaseCallFilter = frame_support::traits::Everything;
+    /// Block & extrinsics weights: base values and limits.
+    type BlockWeights = BlockWeights;
+    /// The maximum length of a block (in bytes).
+    type BlockLength = BlockLength;
+    /// The identifier used to distinguish between accounts.
+    type AccountId = AccountId;
+    /// The aggregated dispatch type that is available for extrinsics.
+    type RuntimeCall = RuntimeCall;
+    /// The lookup mechanism to get account ID from whatever is passed in dispatchers.
+    type Lookup = AccountIdLookup<AccountId, ()>;
+    /// The type for hashing blocks and tries.
+    type Hash = Hash;
+    /// The hashing algorithm used (quantum-resistant hasher with QRNG entropy pool support).
+    type Hashing = QuantumHasher;
+    /// The ubiquitous event type.
+    type RuntimeEvent = RuntimeEvent;
+    /// The ubiquitous origin type.
+    type RuntimeOrigin = RuntimeOrigin;
+    /// Maximum number of block number to block hash mappings to keep (oldest pruned first).
+    type BlockHashCount = BlockHashCount;
+    /// The weight of database operations that the runtime can invoke.
+    type DbWeight = ParityDbWeight;
+    /// Version of the runtime.
+    type Version = Version;
+    /// Converts a module to the index of the module in `construct_runtime!`.
+    type PalletInfo = PalletInfo;
+    /// What to do if a new account is created.
+    type OnNewAccount = ();
+    /// What to do if an account is fully reaped from the system.
+    type OnKilledAccount = ();
+    /// The data to be stored in an account.
+    type AccountData = pallet_balances::AccountData<Balance>;
+    /// Weight information for the extrinsics of this pallet.
+    type SystemWeightInfo = ();
+    /// This is used as an identifier of the chain. 42 is the generic substrate prefix.
+    type SS58Prefix = SS58Prefix;
+    /// The set code logic, just the default since we're not a parachain.
+    type OnSetCode = ();
+    type MaxConsumers = frame_support::traits::ConstU32<16>;
+    type MultiBlockMigrator = ();
+    type PreInherents = ();
+    type PostInherents = ();
+    type PostTransactions = ();
+    type RuntimeTask = ();
+    type Nonce = Index;
+    type Block = Block;
+    type ExtensionsWeightInfo = ();
+    // Notarial v0→v1: add requester proof fields to existing attestations.
+    // It checks the storage version and skips once applied.
+    // spec47: unreserve QCAD vault collateral, then clear the Stablecoin and
+    // Devonomics storage. Remove from this tuple in spec 48.
+    type SingleBlockMigrations = (
+        pallet_notarial::migrations::v1::MigrateV0ToV1<Runtime>,
+        migrations::spec47::Migrations,
+    );
+}
+
+impl pallet_aura::Config for Runtime {
+    type AuthorityId = AuraId;
+    type DisabledValidators = ();
+    // 256: was 32, which hard-capped the network at 32 validators (genesis for
+    // N=64 trapped in initialize_authorities — found by the 2026-07-08 scaling
+    // ladder). Next ceilings up: ValidatorSetMaxValidators below, then
+    // MAX_VOTES_PER_CERTIFICATE=100 in the sdk fork (needs a fork PR past N≈149).
+    type MaxAuthorities = ConstU32<256>;
+    type AllowMultipleBlocksPerSlot = ConstBool<false>;
+    type SlotDuration = ConstU64<SLOT_DURATION>;
+}
+
+parameter_types! {
+    pub const Period: u32 = 6 * HOURS;
+    pub const Offset: u32 = 0;
+}
+
+impl pallet_session::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type ValidatorId = AccountId;
+    type ValidatorIdOf = sp_runtime::traits::ConvertInto;
+    type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
+    type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
+    type SessionManager = ValidatorSet;
+    type SessionHandler = <opaque::SessionKeys as sp_runtime::traits::OpaqueKeys>::KeyTypeIdProviders;
+    type Keys = opaque::SessionKeys;
+    type WeightInfo = ();
+    type Currency = Balances;
+    type KeyDeposit = ConstU128<0>;
+    type DisablingStrategy = ();
+}
+
+impl pallet_authorship::Config for Runtime {
+    type FindAuthor = pallet_session::FindAccountFromAuthorIndex<Self, Aura>;
+    type EventHandler = ValidatorRewards;
+}
+
+// GRANDPA Config removed - quantum-vulnerable finality gadget
+// Using Proof of Coherence for quantum-safe consensus
+
+impl pallet_timestamp::Config for Runtime {
+    /// A timestamp: milliseconds since the unix epoch.
+    type Moment = u64;
+    type OnTimestampSet = Aura;
+    type MinimumPeriod = ConstU64<{ SLOT_DURATION / 2 }>;
+    type WeightInfo = ();
+}
+
+/// Existential deposit.
+pub const EXISTENTIAL_DEPOSIT: u128 = 500;
+
+impl pallet_balances::Config for Runtime {
+    type MaxLocks = ConstU32<50>;
+    type MaxReserves = ();
+    type ReserveIdentifier = [u8; 8];
+    /// The type for recording an account's balance.
+    type Balance = Balance;
+    /// The ubiquitous event type.
+    type RuntimeEvent = RuntimeEvent;
+    type DustRemoval = ();
+    type ExistentialDeposit = ConstU128<EXISTENTIAL_DEPOSIT>;
+    type AccountStore = System;
+    type WeightInfo = pallet_balances::weights::SubstrateWeight<Runtime>;
+    type FreezeIdentifier = ();
+    type MaxFreezes = ();
+    type RuntimeHoldReason = RuntimeHoldReason;
+    type RuntimeFreezeReason = ();
+    type DoneSlashHandler = ();
+}
+
+impl pallet_transaction_payment::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type OnChargeTransaction = CurrencyAdapter<Balances, ()>;
+    type OperationalFeeMultiplier = ConstU8<5>;
+    type WeightToFee = IdentityFee<Balance>;
+    type LengthToFee = IdentityFee<Balance>;
+    type FeeMultiplierUpdate = ();
+    type WeightInfo = ();
+}
+
+impl pallet_sudo::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type RuntimeCall = RuntimeCall;
+    type WeightInfo = ();
+}
+
+// Simple randomness provider for quantum crypto initialization
+// This provides basic randomness until quantum entropy pool is populated
+pub struct TimestampRandomness;
+impl frame_support::traits::Randomness<Hash, BlockNumber> for TimestampRandomness {
+    fn random(subject: &[u8]) -> (Hash, BlockNumber) {
+        let block_number = frame_system::Pallet::<Runtime>::block_number();
+        let block_hash = frame_system::Pallet::<Runtime>::block_hash(block_number);
+
+        // Mix timestamp, block hash, and subject
+        let timestamp = pallet_timestamp::Pallet::<Runtime>::get();
+        let mut data = Vec::new();
+        data.extend_from_slice(block_hash.as_ref());
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data.extend_from_slice(subject);
+
+        let randomness = <Runtime as frame_system::Config>::Hashing::hash(&data);
+        (randomness, block_number)
+    }
+}
+
+// Quantum pallet configs moved to quantum_config.rs to avoid duplication
+
+impl pallet_runtime_segmentation::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MyRandomness = quantum_config::QuantumRandomness;
+}
+
+// Configure ChunkedUpgrade pallet (for runtime upgrades larger than BlockLength)
+impl pallet_runtime_segmentation::chunked_upgrade::pallet::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+}
+
+// Configure SphincsKeystore pallet
+impl pallet_sphincs_keystore::Config for Runtime {}
+
+// Configure ValidatorEntropy pallet
+parameter_types! {
+    pub const MaxDevices: u32 = 10;
+    pub const MaxValidators: u32 = 1000;
+}
+
+impl pallet_validator_entropy::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxDevices = MaxDevices;
+    type MaxValidators = MaxValidators;
+    type WeightInfo = pallet_validator_entropy::weights::SubstrateWeight<Runtime>;
+}
+
+// Configure RelayCoordination pallet
+pub const UNITS: Balance = 1_000_000_000_000_000_000; // 1 QMHY = 10^18 base units
+
+parameter_types! {
+    pub const MinRelayStake: Balance = 100 * UNITS;
+    pub const RelayElectionInterval: BlockNumber = 100;
+    pub const MaxRelayCandidates: u32 = 100;
+    pub const MaxElectedRelaysPerRegion: u32 = 10;
+    pub const MinUptimePercentage: u8 = 80;
+    pub const SlashPercentage: Perbill = Perbill::from_percent(10);
+}
+
+impl pallet_relay_coordination::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type MinRelayStake = MinRelayStake;
+    type RelayElectionInterval = RelayElectionInterval;
+    type MaxRelayCandidates = MaxRelayCandidates;
+    type MaxElectedRelaysPerRegion = MaxElectedRelaysPerRegion;
+    type MinUptimePercentage = MinUptimePercentage;
+    type SlashPercentage = SlashPercentage;
+    type WeightInfo = pallet_relay_coordination::weights::SubstrateWeight<Runtime>;
+    type ValidatorSet = Session;
+}
+
+// Dev Governance pallet configuration
+parameter_types! {
+    /// Minimum deposit to create a proposal (10 UNITS)
+    pub const MinProposalDeposit: Balance = 10 * UNITS;
+    /// Minimum stake to vote (1 UNIT)
+    pub const MinVoteStake: Balance = 1 * UNITS;
+    /// Default voting period (7 days in blocks)
+    pub const DefaultVotingPeriod: BlockNumber = 7 * DAYS;
+}
+
+impl pallet_dev_governance::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type MinProposalDeposit = MinProposalDeposit;
+    type MinVoteStake = MinVoteStake;
+    type DefaultVotingPeriod = DefaultVotingPeriod;
+    type AdminOrigin = EnsureRoot<AccountId>;
+}
+
+// Validator Rewards pallet configuration
+impl pallet_validator_rewards::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type SlashOrigin = EnsureRoot<AccountId>;
+    type RewardOrigin = EnsureRoot<AccountId>;
+}
+
+// Substrate Validator Set pallet configuration
+parameter_types! {
+    pub const MinAuthorities: u32 = 1;
+    pub const ValidatorSetMaxValidators: u32 = 256; // was 100; aligned with Aura MaxAuthorities
+}
+
+impl substrate_validator_set::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type AddRemoveOrigin = EnsureRoot<AccountId>;
+    type MinAuthorities = MinAuthorities;
+    type MaxValidators = ValidatorSetMaxValidators;
+    type WeightInfo = substrate_validator_set::weights::SubstrateWeight<Runtime>;
+    type ValidatorIdToAccountId = sp_runtime::traits::ConvertInto;
+    type AccountIdToValidatorId = sp_runtime::traits::ConvertInto;
+    type Lookup = AccountIdLookup<AccountId, ()>;
+    type EVMAddress = sp_core::H160;
+    type Randomness = quantum_config::QuantumRandomness;
+}
+
+// Onboarding-commit pallet: commit-reveal validator onboarding.
+// See pallets/pallet-onboarding-commit/src/lib.rs and
+// docs/ops/onboarding-and-upgrades-IMPL-2026-05-02.md for the full design.
+parameter_types! {
+    /// Bond locked at commit-time, returned on clean reveal, slashed on
+    /// successful challenge. Decision D1: 100 QMHY.
+    pub const OnboardingCommitBond: Balance = 100 * EXISTENTIAL_DEPOSIT;
+    /// Blocks between commit and earliest valid reveal. Decision D2: 50 blocks
+    /// (~5 min @ 6s slot). Long enough for challenger to react, short enough
+    /// not to gate honest onboarding.
+    pub const OnboardingDisputeWindow: BlockNumber = 50;
+}
+
+/// Adapter: lets pallet-onboarding-commit add a validator after a clean
+/// reveal by calling into substrate-validator-set's internal hook. The
+/// internal hook bypasses the AddRemoveOrigin check, which is correct here
+/// because the commit-reveal flow IS the authorization (bond + dispute
+/// window stand in for sudo).
+pub struct OnboardingValidatorMutator;
+impl pallet_onboarding_commit::ValidatorMutator<AccountId> for OnboardingValidatorMutator {
+    fn add_validator(account_id: AccountId) -> sp_runtime::DispatchResult {
+        substrate_validator_set::Pallet::<Runtime>::add_validator_internal(account_id)
+    }
+}
+
+impl pallet_onboarding_commit::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type CommitBond = OnboardingCommitBond;
+    type DisputeWindow = OnboardingDisputeWindow;
+    type ValidatorMutator = OnboardingValidatorMutator;
+}
+
+// Credential vault — on-chain commitments to off-chain encrypted
+// credentials. Realizes Theorem 11 (crypto-shredding completeness)
+// from the identity-architecture treatise. Closes the structural
+// key-loss class from QH#33.
+parameter_types! {
+    /// Hard cap per holder. Tuned conservatively for v0.1; governance
+    /// can raise it deliberately when usage patterns are clearer.
+    pub const MaxCommitmentsPerHolder: u32 = 256;
+}
+impl pallet_credential_vault::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxCommitmentsPerHolder = MaxCommitmentsPerHolder;
+}
+
+// Substrate Attestation pallet — LLM weights provenance per §11.5 of
+// the identity-architecture treatise. Closes #34 item 6.
+parameter_types! {
+    /// Hard cap per attester identity. Conservative for v0.1;
+    /// governance can raise once usage patterns are clear.
+    pub const MaxModelsPerAttester: u32 = 64;
+}
+impl pallet_substrate_attestation::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxModelsPerAttester = MaxModelsPerAttester;
+}
+
+// Reputation tokens — per-identity reputation accounting on multiple
+// verifier axes. Realizes #34 item 5.
+parameter_types! {
+    /// One day's worth of 12s blocks. Permissionless decay sweep is
+    /// rate-limited to once per day on mainnet; can be loosened by
+    /// sudo later by lowering the constant in a runtime upgrade.
+    pub const ReputationDecayCooldownBlocks: BlockNumber = 7_200;
+}
+impl pallet_reputation_tokens::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type DecayCooldownBlocks = ReputationDecayCooldownBlocks;
+}
+
+// Thin slasher — BGFL 4-layer justice stake layer (#51 mainnet pre-req).
+// Conservative testnet defaults: small minimum deposit, 50% slash, sudo
+// as the ConvictionOrigin. Mainnet should re-tune via runtime upgrade
+// once economic parameters are decided.
+parameter_types! {
+    pub const ThinSlasherMinimumDeposit: Balance = 1_000_000_000_000; // 1 token
+    pub ThinSlasherSlashFraction: sp_runtime::Permill = sp_runtime::Permill::from_percent(50);
+}
+impl pallet_thin_slasher::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type MinimumDeposit = ThinSlasherMinimumDeposit;
+    type SlashFraction = ThinSlasherSlashFraction;
+    type ConvictionOrigin = EnsureRoot<AccountId>;
+}
+
+// Validator Governance pallet configuration (short voting period for testing)
+parameter_types! {
+    pub const ValidatorVotingPeriod: BlockNumber = 10; // ~1 minute for testing
+    pub const MinimumVotes: u32 = 1; // Low threshold for testing
+}
+
+impl pallet_validator_governance::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type VotingPeriod = ValidatorVotingPeriod;
+    type MinimumVotes = MinimumVotes;
+}
+
+// Ricardian Contracts pallet configuration
+parameter_types! {
+    pub const MinContractDuration: BlockNumber = 10; // Minimum blocks before contract can expire
+}
+
+impl pallet_ricardian_contracts::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MinContractDuration = MinContractDuration;
+}
+
+// Axiom Attestation pallet configuration
+parameter_types! {
+    pub const MaxAttestationsPerBlock: u32 = 10;
+}
+
+impl pallet_axiom_attestation::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxAttestationsPerBlock = MaxAttestationsPerBlock;
+}
+
+// Coherence Attestation pallet configuration (PoC v2/v3 stake: L gated by CHSH witness)
+parameter_types! {
+    pub const CoherenceSMilliMin: u32 = 2000; // S > 2 (milli-units)
+    pub const CoherenceQberPpmMax: u32 = 95_000; // 9.5% QBER cutoff
+    pub const CoherenceRoundWindow: u64 = 8;
+    pub const CoherenceMaxCounterparties: u32 = 64;
+}
+
+impl pallet_coherence_attestation::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type SMilliMin = CoherenceSMilliMin;
+    type QberPpmMax = CoherenceQberPpmMax;
+    type RoundWindow = CoherenceRoundWindow;
+    type MaxCounterparties = CoherenceMaxCounterparties;
+    type Slasher = (); // no-op until ThinSlasher implements CoherenceSlasher
+    type WeightInfo = pallet_coherence_attestation::weights::SubstrateWeight<Runtime>;
+}
+
+// Drista secure message routing
+parameter_types! {
+    pub const MaxEnvelopesPerBlock: u32 = 50;
+}
+
+impl pallet_drista::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxEnvelopesPerBlock = MaxEnvelopesPerBlock;
+}
+
+// Notarial pallet configuration
+parameter_types! {
+    pub const MinWitnesses: u32 = 2; // Witnesses needed for certification
+    pub const DefaultValidityPeriod: BlockNumber = 0; // 0 = permanent attestations by default
+}
+
+impl pallet_notarial::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MinWitnesses = MinWitnesses;
+    type DefaultValidityPeriod = DefaultValidityPeriod;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Transparence Integration
+// ═══════════════════════════════════════════════════════════════
+
+parameter_types! {
+    pub const MaxValidationsPerBlock: u32 = 20;
+    pub const CeremonyExpiryBlocks: u32 = 14400; // ~24h at 6s blocks
+}
+
+impl pallet_transparence_oracle::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxValidationsPerBlock = MaxValidationsPerBlock;
+}
+
+impl pallet_transparence_twomanrule::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type CeremonyExpiryBlocks = CeremonyExpiryBlocks;
+    type ForceOrigin = frame_system::EnsureRoot<AccountId>;
+}
+
+impl pallet_transparence_deliverables::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+}
+
+impl pallet_identity_registry::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type ForceOrigin = frame_system::EnsureRoot<AccountId>;
+}
+
+// Mesh Forum pallet configuration
+parameter_types! {
+    pub const MaxMessageLength: u32 = 512;
+    pub const MaxMessages: u32 = 10_000;
+}
+
+impl pallet_mesh_forum::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxMessageLength = MaxMessageLength;
+    type MaxMessages = MaxMessages;
+}
+
+parameter_types! {
+    // Minimum 1 day before trigger (at 3s blocks = 28,800 blocks)
+    pub const MinTrustDuration: BlockNumber = 28_800;
+    // Maximum 10 years (at 3s blocks = ~105,120,000 blocks)
+    pub const MaxTrustDuration: BlockNumber = 105_120_000;
+    // Minimum 1 QMHY deposit (18 decimals)
+    pub const MinTrustDeposit: Balance = 1_000_000_000_000_000_000;
+}
+
+impl pallet_fideicommis::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type MinTrustDuration = MinTrustDuration;
+    type MaxTrustDuration = MaxTrustDuration;
+    type MinDeposit = MinTrustDeposit;
+    type ForceOrigin = EnsureRoot<AccountId>;
+}
+
+// Consensus Level pallet configuration
+impl pallet_consensus_level::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+}
+
+// Topological coherence pallet configuration
+parameter_types! {
+    pub const MaxEntitiesPerAccount: u32 = 64;
+}
+
+impl pallet_topological_coherence::Config for Runtime {
+    type MaxEntitiesPerAccount = MaxEntitiesPerAccount;
+    type WeightInfo = pallet_topological_coherence::weights::SubstrateWeight<Runtime>;
+}
+
+// Governance parameters
+parameter_types! {
+    pub const LaunchPeriod: BlockNumber = 7 * DAYS;
+    pub const VotingPeriod: BlockNumber = 7 * DAYS;
+    pub const FastTrackVotingPeriod: BlockNumber = 3 * HOURS;
+    pub const MinimumDeposit: Balance = 100 * EXISTENTIAL_DEPOSIT;
+    pub const EnactmentPeriod: BlockNumber = 1 * DAYS;
+    pub const CooloffPeriod: BlockNumber = 7 * DAYS;
+    pub const InstantAllowed: bool = true;
+    pub const MaxVotes: u32 = 100;
+    pub const MaxProposals: u32 = 100;
+}
+
+// Council collective instance (must be defined before democracy config)
+type CouncilCollective = pallet_collective::Instance1;
+
+parameter_types! {
+    pub const CouncilMotionDuration: BlockNumber = 3 * DAYS;
+    pub const CouncilMaxProposals: u32 = 100;
+    pub const CouncilMaxMembers: u32 = 100;
+    pub const TechnicalMotionDuration: BlockNumber = 3 * DAYS;
+    pub const TechnicalMaxProposals: u32 = 100;
+    pub const TechnicalMaxMembers: u32 = 100;
+    pub MaxCollectivesProposalWeight: Weight = Perbill::from_percent(50) *
+        BlockWeights::get().max_block;
+}
+
+impl pallet_collective::Config<CouncilCollective> for Runtime {
+    type RuntimeOrigin = RuntimeOrigin;
+    type Proposal = RuntimeCall;
+    type RuntimeEvent = RuntimeEvent;
+    type MotionDuration = CouncilMotionDuration;
+    type MaxProposals = CouncilMaxProposals;
+    type MaxMembers = CouncilMaxMembers;
+    type DefaultVote = pallet_collective::PrimeDefaultVote;
+    type WeightInfo = pallet_collective::weights::SubstrateWeight<Runtime>;
+    type SetMembersOrigin = EnsureRoot<Self::AccountId>;
+    type MaxProposalWeight = MaxCollectivesProposalWeight;
+    type DisapproveOrigin = EnsureRoot<AccountId>;
+    type KillOrigin = EnsureRoot<AccountId>;
+    type Consideration = ();
+}
+
+// Technical collective instance
+type TechnicalCollective = pallet_collective::Instance2;
+impl pallet_collective::Config<TechnicalCollective> for Runtime {
+    type RuntimeOrigin = RuntimeOrigin;
+    type Proposal = RuntimeCall;
+    type RuntimeEvent = RuntimeEvent;
+    type MotionDuration = TechnicalMotionDuration;
+    type MaxProposals = TechnicalMaxProposals;
+    type MaxMembers = TechnicalMaxMembers;
+    type DefaultVote = pallet_collective::PrimeDefaultVote;
+    type WeightInfo = pallet_collective::weights::SubstrateWeight<Runtime>;
+    type SetMembersOrigin = EnsureRoot<Self::AccountId>;
+    type MaxProposalWeight = MaxCollectivesProposalWeight;
+    type DisapproveOrigin = EnsureRoot<AccountId>;
+    type KillOrigin = EnsureRoot<AccountId>;
+    type Consideration = ();
+}
+
+// Scheduler configuration (must be before democracy)
+parameter_types! {
+    pub MaximumSchedulerWeight: Weight = Perbill::from_percent(80) *
+        BlockWeights::get().max_block;
+}
+
+impl pallet_scheduler::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type RuntimeOrigin = RuntimeOrigin;
+    type PalletsOrigin = OriginCaller;
+    type RuntimeCall = RuntimeCall;
+    type MaximumWeight = MaximumSchedulerWeight;
+    type ScheduleOrigin = EnsureRoot<AccountId>;
+    type MaxScheduledPerBlock = ConstU32<50>;
+    type WeightInfo = pallet_scheduler::weights::SubstrateWeight<Runtime>;
+    type OriginPrivilegeCmp = EqualPrivilegeOnly;
+    type Preimages = Preimage;
+    type BlockNumberProvider = frame_system::Pallet<Runtime>;
+}
+
+// Preimage configuration (must be before democracy)
+parameter_types! {
+    pub const PreimageBaseDeposit: Balance = EXISTENTIAL_DEPOSIT;
+    pub const PreimageByteDeposit: Balance = EXISTENTIAL_DEPOSIT / 100;
+}
+
+impl pallet_preimage::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type WeightInfo = pallet_preimage::weights::SubstrateWeight<Runtime>;
+    type Currency = Balances;
+    type ManagerOrigin = EnsureRoot<AccountId>;
+    type Consideration = ();
+}
+
+impl pallet_democracy::Config for Runtime {
+    type RuntimeEvent = RuntimeEvent;
+    type Currency = Balances;
+    type EnactmentPeriod = EnactmentPeriod;
+    type LaunchPeriod = LaunchPeriod;
+    type VotingPeriod = VotingPeriod;
+    type VoteLockingPeriod = EnactmentPeriod;
+    type MinimumDeposit = MinimumDeposit;
+    type ExternalOrigin = EnsureRoot<AccountId>;
+    type ExternalMajorityOrigin = EnsureRoot<AccountId>;
+    type ExternalDefaultOrigin = EnsureRoot<AccountId>;
+    type FastTrackOrigin = EnsureRoot<AccountId>;
+    type InstantOrigin = EnsureRoot<AccountId>;
+    type InstantAllowed = InstantAllowed;
+    type FastTrackVotingPeriod = FastTrackVotingPeriod;
+    type CancellationOrigin = EnsureRoot<AccountId>;
+    type BlacklistOrigin = EnsureRoot<AccountId>;
+    type CancelProposalOrigin = EnsureRoot<AccountId>;
+    type VetoOrigin = pallet_collective::EnsureMember<AccountId, CouncilCollective>;
+    type CooloffPeriod = CooloffPeriod;
+    type Slash = ();
+    type Scheduler = Scheduler;
+    type PalletsOrigin = OriginCaller;
+    type MaxVotes = MaxVotes;
+    type WeightInfo = pallet_democracy::weights::SubstrateWeight<Runtime>;
+    type MaxProposals = MaxProposals;
+    type Preimages = Preimage;
+    type MaxDeposits = ConstU32<100>;
+    type MaxBlacklisted = ConstU32<100>;
+    type SubmitOrigin = frame_system::EnsureSigned<AccountId>;
+}
+
+// Treasury configuration - temporarily disabled due to Pay trait API changes in fork
+// NOTE: Treasury disabled due to Pay trait API changes in Substrate fork
+// parameter_types! {
+//     pub const TreasuryPalletId: PalletId = PalletId(*b"py/trsry");
+//     pub const ProposalBond: Permill = Permill::from_percent(5);
+//     pub const ProposalBondMinimum: Balance = 100 * EXISTENTIAL_DEPOSIT;
+//     pub const ProposalBondMaximum: Balance = 500 * EXISTENTIAL_DEPOSIT;
+//     pub const SpendPeriod: BlockNumber = 24 * DAYS;
+//     pub const Burn: Permill = Permill::from_percent(1);
+//     pub const TreasuryMaxApprovals: u32 = 100;
+//     pub const PayoutSpendPeriod: BlockNumber = 30 * DAYS;
+// }
+
+// Off-chain worker unsigned transaction support
+impl<LocalCall> frame_system::offchain::CreateTransactionBase<LocalCall> for Runtime
+where
+    RuntimeCall: From<LocalCall>,
+{
+    type Extrinsic = UncheckedExtrinsic;
+    type RuntimeCall = RuntimeCall;
+}
+
+impl<LocalCall> frame_system::offchain::CreateBare<LocalCall> for Runtime
+where
+    RuntimeCall: From<LocalCall>,
+{
+    fn create_bare(call: RuntimeCall) -> UncheckedExtrinsic {
+        UncheckedExtrinsic::new_bare(call)
+    }
+}
+
+// Create the runtime by composing the FRAME pallets that were previously configured.
+construct_runtime!(
+    pub struct Runtime
+    where
+        Block = Block,
+        NodeBlock = opaque::Block,
+        UncheckedExtrinsic = UncheckedExtrinsic,
+    {
+        System: frame_system = 0,
+        Timestamp: pallet_timestamp = 1,
+        Aura: pallet_aura = 2,
+        // Grandpa removed - quantum-vulnerable (Ed25519/BLS signatures)
+        Session: pallet_session = 3,
+        Authorship: pallet_authorship = 4,
+        Balances: pallet_balances = 5,
+        TransactionPayment: pallet_transaction_payment = 6,
+        Sudo: pallet_sudo = 7,
+
+        // Governance pallets - enabled for decentralized runtime upgrades
+        Scheduler: pallet_scheduler = 8,
+        Preimage: pallet_preimage = 9,
+        Democracy: pallet_democracy = 10,
+        Council: pallet_collective::<Instance1> = 11,
+        TechnicalCommittee: pallet_collective::<Instance2> = 12,
+        // Treasury: pallet_treasury, // Temporarily disabled - Pay trait API changes
+
+        // Quantum pallets - providing quantum-safe consensus and entropy
+        QuantumCrypto: pallet_quantum_crypto = 13,
+        ProofOfCoherence: pallet_proof_of_coherence = 14,
+        RuntimeSegmentation: pallet_runtime_segmentation = 15,
+        ChunkedUpgrade: pallet_runtime_segmentation::chunked_upgrade::pallet = 16,
+        ValidatorEntropy: pallet_validator_entropy = 17,
+        RelayCoordination: pallet_relay_coordination = 18,
+        SphincsKeystore: pallet_sphincs_keystore = 19,
+
+        // Dev governance pallet - tokenized voting for feature proposals
+        DevGovernance: pallet_dev_governance = 20,
+
+        // Validator rewards pallet - economic incentives for validators
+        ValidatorRewards: pallet_validator_rewards = 21,
+
+        // Validator set management
+        ValidatorSet: substrate_validator_set = 22,
+
+        // Commit-reveal validator onboarding (pipeline-onboarding-v1, spec_version 36+)
+        OnboardingCommit: pallet_onboarding_commit = 23,
+
+        // Credential vault — closes QH#33 structural key-loss class
+        CredentialVault: pallet_credential_vault = 24,
+
+        // Substrate attestation — LLM weights provenance (#34 item 6)
+        SubstrateAttestation: pallet_substrate_attestation = 25,
+
+        // Reputation tokens — per-identity reputation (#34 item 5)
+        ReputationTokens: pallet_reputation_tokens = 26,
+
+        // Thin slasher — mainnet pre-req, BGFL 4-layer justice stake layer (#51)
+        ThinSlasher: pallet_thin_slasher = 27,
+
+        // Validator governance - voting on new validator additions
+        ValidatorGovernance: pallet_validator_governance = 28,
+
+        // Axiom autonomous agent attestations
+        AxiomAttestation: pallet_axiom_attestation = 29,
+
+        // Coherence attestation — PoC v2/v3 (L,S) stake gated by CHSH Bell witness
+        CoherenceAttestation: pallet_coherence_attestation = 43,
+
+        // Drista secure message routing (blind session + IPFS CIDs)
+        Drista: pallet_drista = 30,
+
+        // Legal Governance pallets
+        RicardianContracts: pallet_ricardian_contracts = 31,
+        Notarial: pallet_notarial = 32,
+		MeshForum: pallet_mesh_forum = 33,
+        Fideicommis: pallet_fideicommis = 34,
+        // 35 was Stablecoin (QCAD), removed in spec 47. Do not reuse.
+
+        // Adaptive consensus level tracking
+        ConsensusLevel: pallet_consensus_level = 36,
+
+        // 37 was Devonomics, removed in spec 47. Do not reuse.
+
+        // Topological coherence - Tonnetz torus validation for inference systems
+        TopologicalCoherence: pallet_topological_coherence = 38,
+
+        // Transparence Integration
+        TransparenceOracle: pallet_transparence_oracle = 39,
+        TransparenceTwoManRule: pallet_transparence_twomanrule = 40,
+        TransparenceDeliverables: pallet_transparence_deliverables = 41,
+
+        // PQ Identity Registry (Kylin-inspired dynamic NFT identities)
+        IdentityRegistry: pallet_identity_registry = 42,
+    }
+);
+
+/// The address format for describing accounts.
+pub type Address = sp_runtime::MultiAddress<AccountId, ()>;
+/// Block header type as expected by this runtime (using quantum-resistant QuantumHasher).
+pub type Header = generic::Header<BlockNumber, QuantumHasher>;
+/// Block type as expected by this runtime.
+pub type Block = generic::Block<Header, UncheckedExtrinsic>;
+/// The SignedExtension to the basic transaction logic.
+pub type SignedExtra = (
+    frame_system::CheckNonZeroSender<Runtime>,
+    frame_system::CheckSpecVersion<Runtime>,
+    frame_system::CheckTxVersion<Runtime>,
+    frame_system::CheckGenesis<Runtime>,
+    frame_system::CheckEra<Runtime>,
+    frame_system::CheckNonce<Runtime>,
+    frame_system::CheckWeight<Runtime>,
+    pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+);
+
+/// Unchecked extrinsic type as expected by this runtime.
+pub type UncheckedExtrinsic =
+    generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
+/// The payload being signed in transactions.
+pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
+/// Executive: handles dispatch to the various modules.
+pub type Executive = frame_executive::Executive<
+    Runtime,
+    Block,
+    frame_system::ChainContext<Runtime>,
+    Runtime,
+    AllPalletsWithSystem,
+>;
+
+/// The SignedExtension to the basic transaction logic.
+pub type BlockNumber = u32;
+
+/// Block time constants
+pub const MILLISECS_PER_BLOCK: u64 = 3000;
+pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
+
+// Time is measured by number of blocks.
+pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
+pub const HOURS: BlockNumber = MINUTES * 60;
+pub const DAYS: BlockNumber = HOURS * 24;
+
+impl_runtime_apis! {
+    impl sp_api::Core<Block> for Runtime {
+        fn version() -> RuntimeVersion {
+            VERSION
+        }
+
+        fn execute_block(block: Block) {
+            Executive::execute_block(block);
+        }
+
+        fn initialize_block(header: &<Block as BlockT>::Header) -> sp_runtime::ExtrinsicInclusionMode {
+            Executive::initialize_block(header)
+        }
+    }
+
+    impl sp_api::Metadata<Block> for Runtime {
+        fn metadata() -> OpaqueMetadata {
+            OpaqueMetadata::new(Runtime::metadata().into())
+        }
+
+        fn metadata_at_version(version: u32) -> Option<OpaqueMetadata> {
+            Runtime::metadata_at_version(version)
+        }
+
+        fn metadata_versions() -> sp_std::vec::Vec<u32> {
+            Runtime::metadata_versions()
+        }
+    }
+
+    impl sp_block_builder::BlockBuilder<Block> for Runtime {
+        fn apply_extrinsic(extrinsic: <Block as BlockT>::Extrinsic) -> ApplyExtrinsicResult {
+            Executive::apply_extrinsic(extrinsic)
+        }
+
+        fn finalize_block() -> <Block as BlockT>::Header {
+            Executive::finalize_block()
+        }
+
+        fn inherent_extrinsics(data: sp_inherents::InherentData) -> Vec<<Block as BlockT>::Extrinsic> {
+            data.create_extrinsics()
+        }
+
+        fn check_inherents(
+            block: Block,
+            data: sp_inherents::InherentData,
+        ) -> sp_inherents::CheckInherentsResult {
+            data.check_extrinsics(&block)
+        }
+    }
+
+    impl sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block> for Runtime {
+        fn validate_transaction(
+            source: TransactionSource,
+            tx: <Block as BlockT>::Extrinsic,
+            block_hash: <Block as BlockT>::Hash,
+        ) -> TransactionValidity {
+            Executive::validate_transaction(source, tx, block_hash)
+        }
+    }
+
+    impl sp_offchain::OffchainWorkerApi<Block> for Runtime {
+        fn offchain_worker(header: &<Block as BlockT>::Header) {
+            Executive::offchain_worker(header)
+        }
+    }
+
+    impl sp_consensus_aura::AuraApi<Block, AuraId> for Runtime {
+        fn slot_duration() -> sp_consensus_aura::SlotDuration {
+            sp_consensus_aura::SlotDuration::from_millis(SLOT_DURATION)
+        }
+
+        fn authorities() -> Vec<AuraId> {
+            // Fork API change: authorities() method removed, read from storage directly
+            pallet_aura::Authorities::<Runtime>::get().into_inner()
+        }
+    }
+
+    impl sp_session::SessionKeys<Block> for Runtime {
+        fn generate_session_keys(seed: Option<Vec<u8>>) -> Vec<u8> {
+            opaque::SessionKeys::generate(seed)
+        }
+
+        fn decode_session_keys(
+            encoded: Vec<u8>,
+        ) -> Option<Vec<(Vec<u8>, KeyTypeId)>> {
+            opaque::SessionKeys::decode_into_raw_public_keys(&encoded)
+        }
+    }
+
+    // GRANDPA API removed - quantum-vulnerable finality gadget
+    // Finality provided by Proof of Coherence consensus
+
+    impl frame_system_rpc_runtime_api::AccountNonceApi<Block, AccountId, Index> for Runtime {
+        fn account_nonce(account: AccountId) -> Index {
+            System::account_nonce(account)
+        }
+    }
+
+    impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentApi<Block, Balance> for Runtime {
+        fn query_info(
+            uxt: <Block as BlockT>::Extrinsic,
+            len: u32,
+        ) -> pallet_transaction_payment_rpc_runtime_api::RuntimeDispatchInfo<Balance> {
+            TransactionPayment::query_info(uxt, len)
+        }
+        fn query_fee_details(
+            uxt: <Block as BlockT>::Extrinsic,
+            len: u32,
+        ) -> pallet_transaction_payment::FeeDetails<Balance> {
+            TransactionPayment::query_fee_details(uxt, len)
+        }
+        fn query_weight_to_fee(weight: Weight) -> Balance {
+            TransactionPayment::weight_to_fee(weight)
+        }
+        fn query_length_to_fee(length: u32) -> Balance {
+            TransactionPayment::length_to_fee(length)
+        }
+    }
+
+    impl sp_genesis_builder::GenesisBuilder<Block> for Runtime {
+        fn build_state(config: sp_std::vec::Vec<u8>) -> sp_genesis_builder::Result {
+            build_state::<RuntimeGenesisConfig>(config)
+        }
+
+        fn get_preset(id: &Option<sp_genesis_builder::PresetId>) -> Option<sp_std::vec::Vec<u8>> {
+            get_preset::<RuntimeGenesisConfig>(id, &genesis_config_presets::get_preset)
+        }
+
+        fn preset_names() -> sp_std::vec::Vec<sp_genesis_builder::PresetId> {
+            genesis_config_presets::preset_names()
+        }
+    }
+
+    impl wallet_api::WalletApi<Block, AccountId, Balance> for Runtime {
+        fn get_balance(account: AccountId) -> Balance {
+            Balances::free_balance(&account)
+        }
+    }
+
+    impl pallet_validator_rewards::runtime_api::ValidatorRewardsApi<Block, AccountId, Balance> for Runtime {
+        fn validator_stake(account: AccountId) -> Balance {
+            ValidatorRewards::validator_stake(&account)
+        }
+
+        fn pending_rewards(account: AccountId) -> Balance {
+            ValidatorRewards::pending_rewards(&account)
+        }
+
+        fn certification_level(account: AccountId) -> u8 {
+            match ValidatorRewards::certification(&account) {
+                pallet_validator_rewards::CertificationLevel::Uncertified => 0,
+                pallet_validator_rewards::CertificationLevel::KYCVerified => 1,
+                pallet_validator_rewards::CertificationLevel::AgentCertified => 2,
+            }
+        }
+
+        fn all_validators() -> sp_std::vec::Vec<(AccountId, Balance)> {
+            pallet_validator_rewards::ValidatorStake::<Runtime>::iter().collect()
+        }
+
+        fn min_stake() -> Balance {
+            ValidatorRewards::min_stake()
+        }
+
+        fn block_reward() -> Balance {
+            ValidatorRewards::block_reward()
+        }
+
+        fn total_staked() -> Balance {
+            ValidatorRewards::total_staked()
+        }
+    }
+
+    impl pallet_mesh_forum::runtime_api::MeshForumApi<Block, AccountId> for Runtime {
+        fn get_messages(limit: u32, offset: u32) -> sp_std::vec::Vec<(u32, AccountId, u32, sp_std::vec::Vec<u8>)> {
+            let messages = pallet_mesh_forum::Messages::<Runtime>::get();
+            let total = messages.len() as u32;
+
+            messages
+                .into_iter()
+                .enumerate()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|(idx, msg)| {
+                    (
+                        idx as u32,
+                        msg.sender,
+                        msg.block.try_into().unwrap_or(0u32),
+                        msg.content.into_inner(),
+                    )
+                })
+                .collect()
+        }
+
+        fn message_count() -> u32 {
+            pallet_mesh_forum::MessageCount::<Runtime>::get()
+        }
+    }
+
+    impl pallet_axiom_attestation::runtime_api::AxiomAttestationApi<Block, AccountId> for Runtime {
+        fn get_attestation(id: u64) -> Option<(u64, [u8; 32], [u8; 32], u32, sp_std::vec::Vec<u8>, sp_std::vec::Vec<u8>, u32, bool)> {
+            pallet_axiom_attestation::TaskAttestations::<Runtime>::get(id).map(|a| (
+                a.id,
+                a.task_hash,
+                a.description_hash,
+                a.step_count,
+                a.signer_fingerprint.into_inner(),
+                a.provider.into_inner(),
+                a.anchored_at.try_into().unwrap_or(0u32),
+                a.revoked,
+            ))
+        }
+
+        fn verify_task(task_hash: [u8; 32]) -> Option<(u64, u32, u32)> {
+            pallet_axiom_attestation::AttestationByTaskHash::<Runtime>::get(&task_hash)
+                .and_then(|id| pallet_axiom_attestation::TaskAttestations::<Runtime>::get(id)
+                    .map(|a| (
+                        id,
+                        a.anchored_at.try_into().unwrap_or(0u32),
+                        a.step_count,
+                    )))
+        }
+
+        fn get_attestations_by_account(account: AccountId) -> sp_std::vec::Vec<u64> {
+            pallet_axiom_attestation::AttestationsByAccount::<Runtime>::get(&account).into_inner()
+        }
+
+        fn total_attestations() -> u64 {
+            pallet_axiom_attestation::TotalAttestations::<Runtime>::get()
+        }
+    }
+
+    impl pallet_notarial::runtime_api::NotarialRuntimeApi<Block, AccountId> for Runtime {
+        fn get_attestation(id: u64) -> Option<(u64, [u8; 32], u8, sp_std::vec::Vec<u8>, AccountId, u32, Option<u32>, u8, u32, bool)> {
+            pallet_notarial::Attestations::<Runtime>::get(id).map(|a| (
+                a.id,
+                a.document_hash,
+                a.category as u8,
+                a.description.into_inner(),
+                a.attester,
+                a.attested_at.try_into().unwrap_or(0u32),
+                a.expires_at.map(|e| e.try_into().unwrap_or(0u32)),
+                a.status as u8,
+                a.witness_count,
+                a.certified,
+            ))
+        }
+
+        fn verify_document(hash: [u8; 32]) -> Option<(u64, u32, u8, bool, u32)> {
+            pallet_notarial::AttestationByHash::<Runtime>::get(&hash)
+                .and_then(|id| pallet_notarial::Attestations::<Runtime>::get(id)
+                    .map(|a| (
+                        id,
+                        a.attested_at.try_into().unwrap_or(0u32),
+                        a.status as u8,
+                        a.certified,
+                        a.witness_count,
+                    )))
+        }
+
+        fn get_attestations_by_owner(account: AccountId) -> sp_std::vec::Vec<u64> {
+            pallet_notarial::AttestationsByOwner::<Runtime>::get(&account).into_inner()
+        }
+
+        fn get_certificate(id: u64) -> Option<(u64, u64, u32, [u8; 32], AccountId)> {
+            pallet_notarial::Certificates::<Runtime>::get(id)
+                .map(|c| (
+                    c.id,
+                    c.attestation_id,
+                    c.generated_at.try_into().unwrap_or(0u32),
+                    c.certificate_hash,
+                    c.issuer,
+                ))
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn development_genesis_config() -> RuntimeGenesisConfig {
+    RuntimeGenesisConfig::default()
+}
+
+#[cfg(feature = "std")]
+pub fn create_default_config<T: serde::Serialize + Default>() -> Vec<u8> {
+    serde_json::to_string(&T::default())
+        .expect("Genesis config must be valid")
+        .into_bytes()
+}
+
+#[cfg(feature = "std")]
+pub fn build_config<T: serde::de::DeserializeOwned>(json: Vec<u8>) -> sp_genesis_builder::Result {
+    let _config: T = serde_json::from_slice(&json)
+        .map_err(|e| format!("Invalid JSON blob: {}", e))?;
+    Ok(())
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benches {
+    frame_benchmarking::define_benchmarks!(
+        [frame_benchmarking, BaselineBench::<Runtime>]
+        [frame_system, SystemBench::<Runtime>]
+        [pallet_balances, Balances]
+        [pallet_timestamp, Timestamp]
+        [pallet_validator_entropy, ValidatorEntropy]
+        [pallet_relay_coordination, RelayCoordination]
+        // Governance pallets temporarily disabled
+        // [pallet_democracy, Democracy]
+        // [pallet_collective, Council]
+        // [pallet_treasury, Treasury]
+        // [pallet_scheduler, Scheduler]
+        // [pallet_preimage, Preimage]
+    );
+}

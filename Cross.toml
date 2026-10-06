@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+image = "cross-qh-aarch64-wasm"
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["SKIP_WASM_BUILD"]
